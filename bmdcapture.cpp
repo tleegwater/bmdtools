@@ -258,32 +258,44 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
      * timebase should be 1/framerate and timestamp increments should be
      * identically 1.*/
     displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
-    c->time_base.den = frameRateScale;
-    c->time_base.num = frameRateDuration;
+    st->time_base.den = frameRateScale;
+    st->time_base.num = frameRateDuration;
     c->pix_fmt       = pix_fmt;
 
     if (codec_id == AV_CODEC_ID_V210 || codec_id == AV_CODEC_ID_R210)
         c->bits_per_raw_sample = 10;
     if (codec_id == AV_CODEC_ID_RAWVIDEO)
         c->codec_tag = avcodec_pix_fmt_to_codec_tag(c->pix_fmt);
+    if (codec_id == AV_CODEC_ID_FFV1)
+        fprintf(stderr, "AV_CODEC_ID_FFV1\n");
+        c->bits_per_raw_sample = 10;
+        //c->codec_tag = CODEC_ID_FFV1;
+        c->pix_fmt = PIX_FMT_YUV422P10;
+        c->gop_size = 1;
+        c->coder_type = 1;
+        //fprintf(stderr, "c->codec_tag %u\n", c->codec_tag);
+        fprintf(stderr, "c->pix_fmt %u\n", c->pix_fmt);
     // some formats want stream headers to be separate
     if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
         c->flags |= CODEC_FLAG_GLOBAL_HEADER;
     }
 
     /* find the video encoder */
-    //codec = avcodec_find_encoder(c->codec_id);
-    //if (!codec) {
-    //    fprintf(stderr, "codec not found\n");
-    //    exit(1);
-    //}
+    codec = avcodec_find_encoder(c->codec_id);
+    if (!codec) {
+        fprintf(stderr, "codec not found\n");
+        exit(1);
+    }
+
 
     /* open the codec */
-    // if (avcodec_open2(c, codec, NULL) < 0) {
-    //    fprintf(stderr, "could not open codec\n");
-    //    exit(1);
-    //}
+     if (avcodec_open2(c, codec, NULL) < 0) {
+        fprintf(stderr, "could not open codec\n");
+        exit(1);
+    }
 
+    FFV1Context *f = c->priv_data;
+        f->version = 3;
     return st;
 }
 
@@ -304,8 +316,8 @@ static AVStream *add_data_stream(AVFormatContext *oc, enum AVCodecID codec_id)
     c->codec_type = AVMEDIA_TYPE_DATA;
 
     displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
-    c->time_base.den = frameRateScale;
-    c->time_base.num = frameRateDuration;
+    st->time_base.den = frameRateScale;
+    st->time_base.num = frameRateDuration;
 
     // some formats want stream headers to be separate
     if(oc->oformat->flags & AVFMT_GLOBALHEADER)
@@ -652,6 +664,8 @@ static void set_signal()
 
 int main(int argc, char *argv[])
 {
+
+
     IDeckLinkIterator *deckLinkIterator = CreateDeckLinkIteratorInstance();
     DeckLinkCaptureDelegate *delegate;
     BMDDisplayMode selectedDisplayMode = bmdModeNTSC;
@@ -666,7 +680,11 @@ int main(int argc, char *argv[])
 
     pthread_mutex_init(&sleepMutex, NULL);
     pthread_cond_init(&sleepCond, NULL);
+    
     av_register_all();
+
+    //avcodec_register_all();
+  
 
     if (!deckLinkIterator) {
         fprintf(stderr,
@@ -719,7 +737,7 @@ int main(int argc, char *argv[])
                 break;
             case 10:
                 pix     = bmdFormat10BitYUV;
-                pix_fmt = AV_PIX_FMT_YUV422P10;
+                pix_fmt = AV_PIX_FMT_YUV422P10LE;
                 break;
             default:
                 if (!strcmp("rgb10", optarg)) {
@@ -940,7 +958,8 @@ int main(int argc, char *argv[])
         fmt->video_codec = AV_CODEC_ID_RAWVIDEO;
         break;
     case bmdFormat10BitYUV:
-        fmt->video_codec = AV_CODEC_ID_V210;
+        //fmt->video_codec = AV_CODEC_ID_V210;
+        fmt->video_codec = AV_CODEC_ID_FFV1;
         break;
     case bmdFormat10BitRGB:
         fmt->video_codec = AV_CODEC_ID_R210;

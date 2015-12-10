@@ -28,7 +28,7 @@ prefix ?= /usr
 bindir ?= $(prefix)/bin
 
 CXX = g++
-SDK_PATH = ../../include
+SDK_PATH = /Users/picturae/Downloads/Blackmagic_DeckLink_SDK_10.5/Mac/include
 
 SYS=$(shell uname)
 
