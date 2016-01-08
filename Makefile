@@ -38,7 +38,11 @@ CXXFLAGS = $(ECXXFLAGS)
 LDFLAGS  = $(ELDFLAGS)
 
 CXXFLAGS += `pkg-config --cflags $(PKG_DEPS)` -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS
+#CXXFLAGS += -I/Users/picturae/Downloads/ffmpeg -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS
+
 LDFLAGS  += `pkg-config --libs $(PKG_DEPS)`
+#LDFLAGS  += -L/Users/picturae/Downloads/ffmpeg -lavcodec -lavformat -lswscale -lavutil
+
 
 CXXFLAGS+= -Wno-multichar -I $(SDK_PATH) -fno-rtti -g
 LDFLAGS += -lm -ldl -lpthread

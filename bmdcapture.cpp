@@ -34,8 +34,12 @@
 #include "Capture.h"
 #include "modes.h"
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include "libavformat/avformat.h"
 #include "libavutil/time.h"
+#include "libavutil/pixdesc.h"
+#include <libavutil/imgutils.h>
+#include <libswscale/swscale.h>
 }
 
 pthread_mutex_t sleepMutex;
@@ -187,10 +191,14 @@ static unsigned long long avpacket_queue_size(AVPacketQueue *q)
     return size;
 }
 
+AVFrame *picture;
 AVOutputFormat *fmt = NULL;
 AVFormatContext *oc;
 AVStream *audio_st, *video_st, *data_st;
 BMDTimeValue frameRateDuration, frameRateScale;
+
+AVCodec * bmdCodec;
+AVCodecContext * bmdCodecContext;
 
 static AVStream *add_audio_stream(AVFormatContext *oc, enum AVCodecID codec_id)
 {
@@ -253,6 +261,8 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
     /* resolution must be a multiple of two */
     c->width  = displayMode->GetWidth();
     c->height = displayMode->GetHeight();
+
+    c->bit_rate = 0;
     /* time base: this is the fundamental unit of time (in seconds) in terms
      * of which frame timestamps are represented. for fixed-fps content,
      * timebase should be 1/framerate and timestamp increments should be
@@ -261,20 +271,22 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
     st->time_base.den = frameRateScale;
     st->time_base.num = frameRateDuration;
     c->pix_fmt       = pix_fmt;
-
+    
+    fprintf(stderr, "c->pix_fmt: %s\n", av_get_pix_fmt_name(c->pix_fmt));
+    fprintf(stderr, "codec_id: %d\n", codec_id);
     if (codec_id == AV_CODEC_ID_V210 || codec_id == AV_CODEC_ID_R210)
         c->bits_per_raw_sample = 10;
     if (codec_id == AV_CODEC_ID_RAWVIDEO)
         c->codec_tag = avcodec_pix_fmt_to_codec_tag(c->pix_fmt);
     if (codec_id == AV_CODEC_ID_FFV1)
-        fprintf(stderr, "AV_CODEC_ID_FFV1\n");
+        c->pix_fmt = pix_fmt;
         c->bits_per_raw_sample = 10;
-        //c->codec_tag = CODEC_ID_FFV1;
-        c->pix_fmt = PIX_FMT_YUV422P10;
-        c->gop_size = 1;
+        c->gop_size = 0;
         c->coder_type = 1;
-        //fprintf(stderr, "c->codec_tag %u\n", c->codec_tag);
-        fprintf(stderr, "c->pix_fmt %u\n", c->pix_fmt);
+        c->slice_count = 24;
+        c->level = 3;
+        c->context_model = 1;
+
     // some formats want stream headers to be separate
     if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
         c->flags |= CODEC_FLAG_GLOBAL_HEADER;
@@ -287,15 +299,13 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
         exit(1);
     }
 
-
     /* open the codec */
      if (avcodec_open2(c, codec, NULL) < 0) {
         fprintf(stderr, "could not open codec\n");
         exit(1);
     }
+//
 
-    FFV1Context *f = c->priv_data;
-        f->version = 3;
     return st;
 }
 
@@ -418,16 +428,51 @@ void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame)
     avpacket_queue_put(&queue, &pkt);
 }
 
+AVFrame *allocPicture(enum PixelFormat pix_fmt, int width, int height)
+{
+
+    AVFrame *picture;
+    picture = av_frame_alloc();
+
+    uint8_t *picture_buf;
+    int size;
+
+    picture = av_frame_alloc();
+    if (!picture)
+        return NULL;
+    size = avpicture_get_size(pix_fmt, width, height);
+    picture_buf = (uint8_t*)av_malloc(size *  sizeof(uint8_t));
+    if (!picture_buf)
+    {
+        av_free(picture);
+        return NULL;
+    }
+    avpicture_fill((AVPicture *)picture, picture_buf, pix_fmt, width, height);
+    return picture;
+}
+
+
+
 void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
                         int64_t pts, int64_t duration)
 {
     AVPacket pkt;
+
     AVCodecContext *c;
+    c = video_st->codec;
+
     void *frameBytes;
     time_t cur_time;
 
+    int ret;
+    int got_packet = 0;
+    int got_frame = 0;
+    
+    videoFrame->GetBytes(&frameBytes);
+
+
     av_init_packet(&pkt);
-    c = video_st->codec;
+
     if (g_verbose && frameCount % 25 == 0) {
         unsigned long long qsize = avpacket_queue_size(&queue);
         fprintf(stderr,
@@ -437,7 +482,6 @@ void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
                 (double)qsize / 1024 / 1024);
     }
 
-    videoFrame->GetBytes(&frameBytes);
 
     if (videoFrame->GetFlags() & bmdFrameHasNoInputSource) {
         if (pix_fmt == AV_PIX_FMT_UYVY422 && draw_bars) {
@@ -475,17 +519,48 @@ void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
     }
 
     pkt.dts = pkt.pts = pts;
-
     pkt.duration = duration;
     //To be made sure it still applies
     pkt.flags       |= AV_PKT_FLAG_KEY;
     pkt.stream_index = video_st->index;
     pkt.data         = (uint8_t *)frameBytes;
-    pkt.size         = videoFrame->GetRowBytes() *
-                       videoFrame->GetHeight();
-    //fprintf(stderr,"Video Frame size %d ts %d\n", pkt.size, pkt.pts);
-    c->frame_number++;
-    avpacket_queue_put(&queue, &pkt);
+    pkt.size         = videoFrame->GetRowBytes() * videoFrame->GetHeight();
+
+    picture = av_frame_alloc();
+    
+    picture->width = videoFrame->GetWidth();
+    picture->height = videoFrame->GetHeight();
+    picture->format = pix_fmt;
+    
+    ret = avcodec_decode_video2(bmdCodecContext, picture, &got_frame, &pkt);
+    if (ret < 0) {
+        fprintf(stderr, "Error decoding Decklink packet\n");
+        exit(1);
+    }
+
+    av_init_packet(&pkt);
+    av_free_packet(&pkt);
+
+    ret = avcodec_encode_video2(c, &pkt, picture, &got_packet);
+    if (ret < 0) {
+        fprintf(stderr, "Error encoding AVFrame\n");
+        exit(1);
+    }
+
+    pkt.dts = pkt.pts = pts;
+    pkt.duration = duration;
+    pkt.flags       |= AV_PKT_FLAG_KEY;
+    pkt.stream_index = video_st->index;
+    fprintf(stderr,"Video Frame size %d ts %lld\n", pkt.size, pkt.pts);
+
+    av_free(picture);
+
+    if (got_packet) {
+        ret = avpacket_queue_put(&queue, &pkt);
+    } else {
+        ret = 0;
+    }
+   
 }
 
 
@@ -664,8 +739,6 @@ static void set_signal()
 
 int main(int argc, char *argv[])
 {
-
-
     IDeckLinkIterator *deckLinkIterator = CreateDeckLinkIteratorInstance();
     DeckLinkCaptureDelegate *delegate;
     BMDDisplayMode selectedDisplayMode = bmdModeNTSC;
@@ -680,11 +753,7 @@ int main(int argc, char *argv[])
 
     pthread_mutex_init(&sleepMutex, NULL);
     pthread_cond_init(&sleepCond, NULL);
-    
     av_register_all();
-
-    //avcodec_register_all();
-  
 
     if (!deckLinkIterator) {
         fprintf(stderr,
@@ -737,7 +806,11 @@ int main(int argc, char *argv[])
                 break;
             case 10:
                 pix     = bmdFormat10BitYUV;
-                pix_fmt = AV_PIX_FMT_YUV422P10LE;
+                pix_fmt = AV_PIX_FMT_YUV422P10;
+                break;
+            case 16:
+                pix     = bmdFormat10BitYUV;
+                pix_fmt = AV_PIX_FMT_YUV422P10;
                 break;
             default:
                 if (!strcmp("rgb10", optarg)) {
@@ -955,7 +1028,8 @@ int main(int argc, char *argv[])
 
     switch (pix) {
     case bmdFormat8BitYUV:
-        fmt->video_codec = AV_CODEC_ID_RAWVIDEO;
+        //fmt->video_codec = AV_CODEC_ID_RAWVIDEO;
+        fmt->video_codec = AV_CODEC_ID_FFV1;
         break;
     case bmdFormat10BitYUV:
         //fmt->video_codec = AV_CODEC_ID_V210;
@@ -965,6 +1039,16 @@ int main(int argc, char *argv[])
         fmt->video_codec = AV_CODEC_ID_R210;
         break;
     }
+
+
+    bmdCodec = avcodec_find_decoder(AV_CODEC_ID_V210);
+    bmdCodecContext = avcodec_alloc_context3(bmdCodec);
+    bmdCodecContext->width = displayMode->GetWidth();
+    bmdCodecContext->height = displayMode->GetHeight();
+    avcodec_open2(bmdCodecContext, bmdCodec, NULL);
+
+
+
 
     fmt->audio_codec = (sample_fmt == AV_SAMPLE_FMT_S16 ? AV_CODEC_ID_PCM_S16LE : AV_CODEC_ID_PCM_S32LE);
 
@@ -1000,6 +1084,8 @@ int main(int argc, char *argv[])
     pthread_cond_wait(&sleepCond, &sleepMutex);
     pthread_mutex_unlock(&sleepMutex);
     deckLinkInput->StopStreams();
+    //avcodec_close(oc->streams[0]->codec);
+
     fprintf(stderr, "Stopping Capture\n");
     avpacket_queue_end(&queue);
 
@@ -1025,6 +1111,7 @@ bail:
 
     if (oc != NULL) {
         av_write_trailer(oc);
+
         if (!(fmt->flags & AVFMT_NOFILE)) {
             /* close the output file */
             avio_close(oc->pb);
