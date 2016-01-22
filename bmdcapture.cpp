@@ -28,6 +28,10 @@
 #include <fcntl.h>
 #include <time.h>
 #include <signal.h>
+#include <regex>
+#include <string>
+#include <iostream>
+#include <libwebsockets.h>
 
 #include "compat.h"
 #include "DeckLinkAPI.h"
@@ -40,6 +44,8 @@ extern "C" {
 #include "libavutil/pixdesc.h"
 #include <libavutil/imgutils.h>
 #include <libswscale/swscale.h>
+#include <libavutil/opt.h>
+#include <libavutil/rational.h>
 }
 
 pthread_mutex_t sleepMutex;
@@ -69,6 +75,8 @@ static unsigned long frameCount = 0;
 static unsigned int dropped     = 0, totaldropped = 0;
 static enum AVPixelFormat pix_fmt     = AV_PIX_FMT_UYVY422;
 static enum AVSampleFormat sample_fmt = AV_SAMPLE_FMT_S16;
+static AVRational dar = { 4, 3 };
+
 typedef struct AVPacketQueue {
     AVPacketList *first_pkt, *last_pkt;
     int nb_packets;
@@ -191,7 +199,13 @@ static unsigned long long avpacket_queue_size(AVPacketQueue *q)
     return size;
 }
 
+
+
+struct libwebsocket_context *context;
+AVPacket wspkt;
+
 AVFrame *picture;
+AVFrame *wspicture;
 AVOutputFormat *fmt = NULL;
 AVFormatContext *oc;
 AVStream *audio_st, *video_st, *data_st;
@@ -199,6 +213,13 @@ BMDTimeValue frameRateDuration, frameRateScale;
 
 AVCodec * bmdCodec;
 AVCodecContext * bmdCodecContext;
+
+AVCodec * wsCodec;
+AVCodecContext * wsCodecContext;
+
+
+
+
 
 static AVStream *add_audio_stream(AVFormatContext *oc, enum AVCodecID codec_id)
 {
@@ -226,16 +247,16 @@ static AVStream *add_audio_stream(AVFormatContext *oc, enum AVCodecID codec_id)
         c->flags |= CODEC_FLAG_GLOBAL_HEADER;
     }
 
-    codec = avcodec_find_encoder(c->codec_id);
-    if (!codec) {
-        fprintf(stderr, "codec not found\n");
-        exit(1);
-    }
-
-    if (avcodec_open2(c, codec, NULL) < 0) {
-        fprintf(stderr, "could not open codec\n");
-        exit(1);
-    }
+    //codec = avcodec_find_encoder(c->codec_id);
+    //if (!codec) {
+    //    fprintf(stderr, "codec not found\n");
+    //    exit(1);
+    //}
+//
+    //if (avcodec_open2(c, codec, NULL) < 0) {
+    //    fprintf(stderr, "could not open codec\n");
+    //    exit(1);
+    //}
 
     return st;
 }
@@ -268,12 +289,19 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
      * timebase should be 1/framerate and timestamp increments should be
      * identically 1.*/
     displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
-    st->time_base.den = frameRateScale;
-    st->time_base.num = frameRateDuration;
+    c->time_base.den = frameRateScale;
+    c->time_base.num = frameRateDuration;
     c->pix_fmt       = pix_fmt;
+    c->colorspace = AVCOL_SPC_BT470BG;
+    c->color_trc = AVCOL_TRC_SMPTE170M;
+    c->color_primaries = AVCOL_PRI_BT470BG;
+    c->field_order = AV_FIELD_BT;
     
-    fprintf(stderr, "c->pix_fmt: %s\n", av_get_pix_fmt_name(c->pix_fmt));
-    fprintf(stderr, "codec_id: %d\n", codec_id);
+    AVRational sar = av_d2q((double)displayMode->GetHeight() / displayMode->GetWidth() / dar.den * dar.num, 1024); 
+    c->sample_aspect_ratio.num = sar.num;
+    c->sample_aspect_ratio.den = sar.den;
+
+    
     if (codec_id == AV_CODEC_ID_V210 || codec_id == AV_CODEC_ID_R210)
         c->bits_per_raw_sample = 10;
     if (codec_id == AV_CODEC_ID_RAWVIDEO)
@@ -286,6 +314,15 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
         c->slice_count = 24;
         c->level = 3;
         c->context_model = 1;
+
+    if (codec_id == AV_CODEC_ID_PRORES)
+        c->pix_fmt = pix_fmt;
+        c->bits_per_raw_sample = 10;
+        c->gop_size = 0;
+        c->profile = 3;
+        c->level = 3;
+        av_opt_set(c->priv_data, "vendor", "apl0", 0);
+ 
 
     // some formats want stream headers to be separate
     if (oc->oformat->flags & AVFMT_GLOBALHEADER) {
@@ -305,6 +342,7 @@ static AVStream *add_video_stream(AVFormatContext *oc, enum AVCodecID codec_id)
         exit(1);
     }
 //
+
 
     return st;
 }
@@ -326,8 +364,8 @@ static AVStream *add_data_stream(AVFormatContext *oc, enum AVCodecID codec_id)
     c->codec_type = AVMEDIA_TYPE_DATA;
 
     displayMode->GetFrameRate(&frameRateDuration, &frameRateScale);
-    st->time_base.den = frameRateScale;
-    st->time_base.num = frameRateDuration;
+    c->time_base.den = frameRateScale;
+    c->time_base.num = frameRateDuration;
 
     // some formats want stream headers to be separate
     if(oc->oformat->flags & AVFMT_GLOBALHEADER)
@@ -412,6 +450,7 @@ void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame)
     audioFrame->GetBytes(&audioFrameBytes);
     audioFrame->GetPacketTime(&audio_pts, audio_st->time_base.den);
     pkt.pts = audio_pts / audio_st->time_base.num;
+    
 
     if (initial_audio_pts == AV_NOPTS_VALUE) {
         initial_audio_pts = pkt.pts;
@@ -424,7 +463,8 @@ void write_audio_packet(IDeckLinkAudioInputPacket *audioFrame)
     pkt.stream_index = audio_st->index;
     pkt.data         = (uint8_t *)audioFrameBytes;
     c->frame_number++;
-
+    //fprintf(stderr,"Audio Frame size %d ts %lld\n", pkt.size, pkt.pts);
+    //fprintf(stderr,"A:%lld, %d\n", pkt.pts / 40, c->frame_number);
     avpacket_queue_put(&queue, &pkt);
 }
 
@@ -456,9 +496,12 @@ AVFrame *allocPicture(enum PixelFormat pix_fmt, int width, int height)
 void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
                         int64_t pts, int64_t duration)
 {
+        videoFrame->AddRef();
+
     AVPacket pkt;
 
     AVCodecContext *c;
+
     c = video_st->codec;
 
     void *frameBytes;
@@ -466,6 +509,7 @@ void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
 
     int ret;
     int got_packet = 0;
+    int ws_got_packet = 0;
     int got_frame = 0;
     
     videoFrame->GetBytes(&frameBytes);
@@ -531,6 +575,8 @@ void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
     picture->width = videoFrame->GetWidth();
     picture->height = videoFrame->GetHeight();
     picture->format = pix_fmt;
+
+
     
     ret = avcodec_decode_video2(bmdCodecContext, picture, &got_frame, &pkt);
     if (ret < 0) {
@@ -538,25 +584,76 @@ void write_video_packet(IDeckLinkVideoInputFrame *videoFrame,
         exit(1);
     }
 
+
     av_init_packet(&pkt);
     av_free_packet(&pkt);
 
     ret = avcodec_encode_video2(c, &pkt, picture, &got_packet);
     if (ret < 0) {
-        fprintf(stderr, "Error encoding AVFrame\n");
+        fprintf(stderr, "Error encoding AVFrame (%s)\n", avcodec_get_name(c->codec_id));
         exit(1);
     }
+
+
+
+
+    wspicture = av_frame_alloc();
+    
+    wspicture->width = videoFrame->GetWidth();
+    wspicture->height = videoFrame->GetHeight();
+    wspicture->format = AV_PIX_FMT_YUV420P;
+
+
+    struct SwsContext *resize;
+    resize = sws_getContext(picture->width, picture->height, pix_fmt, wspicture->width, wspicture->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL, NULL, NULL);
+
+    int num_bytes = avpicture_get_size(AV_PIX_FMT_YUV420P, wspicture->width, wspicture->height);
+    uint8_t* frame2_buffer = (uint8_t *)av_malloc(num_bytes*sizeof(uint8_t));
+    avpicture_fill((AVPicture*)wspicture, frame2_buffer, AV_PIX_FMT_YUV420P, wspicture->width, wspicture->height);
+
+    ret = sws_scale(resize, picture->data, picture->linesize, 0, picture->height, wspicture->data, wspicture->linesize);
+
+    if (ret < 0) {
+        fprintf(stderr, "Error sws_scale \n");
+        exit(1);
+    }
+
+    //wspkt.dts = pkt.pts = pts;
+    //wspkt.duration = duration;
+    //wspkt.data         = (uint8_t *)frameBytes;
+    //wspkt.size         = videoFrame->GetRowBytes() * videoFrame->GetHeight();
+
+    av_init_packet(&wspkt);
+    av_free_packet(&wspkt);
+
+
+    //fprintf(stderr, "YEAH %d\n", wsCodecContext->pix_fmt);
+
+    ret = avcodec_encode_video2(wsCodecContext, &wspkt, wspicture, &ws_got_packet);
+
+    if (ret < 0) {
+        fprintf(stderr, "Error encoding AVFrame (%s)\n", avcodec_get_name(wsCodecContext->codec_id));
+        exit(1);
+    }
+
+    //fprintf(stderr, "wspkt.size (%d)\n", wspkt.size);
 
     pkt.dts = pkt.pts = pts;
     pkt.duration = duration;
     pkt.flags       |= AV_PKT_FLAG_KEY;
     pkt.stream_index = video_st->index;
-    fprintf(stderr,"Video Frame size %d ts %lld\n", pkt.size, pkt.pts);
+    //fprintf(stderr,"Video Frame size %d ts %lld ", pkt.size, pkt.pts);
+    
 
     av_free(picture);
 
     if (got_packet) {
+        //fprintf(stderr,"V:%lld, %d\n", pkt.pts / 40, c->frame_number);
         ret = avpacket_queue_put(&queue, &pkt);
+                videoFrame->Release();
+
+            //c->frame_number++;
+
     } else {
         ret = 0;
     }
@@ -572,6 +669,7 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 
     // Handle Video Frame
     if (videoFrame) {
+
         BMDTimeValue frameTime;
         BMDTimeValue frameDuration;
         int64_t pts;
@@ -607,6 +705,8 @@ HRESULT DeckLinkCaptureDelegate::VideoInputFrameArrived(
 
     // Handle Audio Frame
     if (audioFrame)
+        //fprintf(stderr, "A\t");
+
         write_audio_packet(audioFrame);
 
 
@@ -700,6 +800,7 @@ int usage(int status)
         "    -d <filler>          When the source is offline draw a black frame or color bars\n"
         "                         0: black frame\n"
         "                         1: color bars\n"
+        "    -r <aspect ratio>    Aspect ratio (eg 4:3)\n"
         "Capture video and audio to a file.\n"
         "Raw video and audio can be sent to a pipe to avconv or vlc e.g.:\n"
         "\n"
@@ -726,6 +827,83 @@ static void *push_packet(void *ctx)
     return NULL;
 }
 
+
+static int callback_http(struct libwebsocket_context * ssl_cert_filepath, struct libwebsocket *wsi, enum libwebsocket_callback_reasons reason, void *user, void *in, size_t len)
+{
+    return 0;
+}
+
+static int callback_frame(struct libwebsocket_context * self, struct libwebsocket *wsi, enum libwebsocket_callback_reasons reason, void *user, void *in, size_t len)
+{
+    switch (reason) {
+        case LWS_CALLBACK_ESTABLISHED: // just log message that someone is connecting
+            printf("connection established\n");
+            break;
+        case LWS_CALLBACK_SERVER_WRITEABLE: { // the funny part
+ 
+      
+            //printf("wspkt.size: %lu\n", wspkt.size );
+            
+            unsigned char * buffer = (unsigned char*) malloc(LWS_SEND_BUFFER_PRE_PADDING + wspkt.size + LWS_SEND_BUFFER_POST_PADDING );
+            size_t bufferLen = LWS_SEND_BUFFER_PRE_PADDING + wspkt.size + LWS_SEND_BUFFER_POST_PADDING;
+               
+            //printf("buffer len: %lu\n", bufferLen );
+            memcpy (buffer + LWS_SEND_BUFFER_PRE_PADDING, wspkt.data, wspkt.size );
+
+
+            // log what we recieved and what we're going to send as a response.
+            // that disco syntax `%.*s` is used to print just a part of our buffer
+            // http://stackoverflow.com/questions/5189071/print-part-of-char-array
+            //printf("response data: %s\n", buffer );
+            // send response
+            // just notice that we have to tell where exactly our response starts. That's
+            // why there's `buf[LWS_SEND_BUFFER_PRE_PADDING]` and how long it is.
+            // we know that our response has the same length as request because
+            // it's the same message in reverse order.
+            int ret = libwebsocket_write(wsi, &buffer[LWS_SEND_BUFFER_PRE_PADDING], bufferLen, LWS_WRITE_BINARY);
+            //printf("libwebsocket_write: %d\n", ret );
+            ret = libwebsocket_callback_on_writable(self, wsi);
+            //libwebsocket_write(wsi, &buf[LWS_SEND_BUFFER_PRE_PADDING], len, LWS_WRITE_TEXT);
+            // release memory back into the wild
+            usleep(40000);
+            free (buffer);
+            break;
+        }
+        default:
+            break;
+    }
+    
+    return 0;
+}
+
+static struct libwebsocket_protocols protocols[] = {
+    /* first protocol must always be HTTP handler */
+    {
+        "http-only",   // name
+        callback_http, // callback
+        0              // per_session_data_size
+    },
+    {
+        "frame-protocol", // protocol name - very important!
+        callback_frame,   // callback
+        0,                // we don't use any per session data
+        1000000           //rx_buffer_size;
+    },
+    {
+        NULL, NULL, 0   /* End of list */
+    }
+};
+
+static void *start_ws_server(void *data)
+{
+    while (1) {
+        libwebsocket_service(context, 50);
+        libwebsocket_callback_on_writable_all_protocol(&protocols[1]);
+    }
+    return NULL;
+}
+
+
 static void exit_handler(int sig)
 {
    pthread_cond_signal(&sleepCond);
@@ -736,6 +914,12 @@ static void set_signal()
     signal(SIGINT , exit_handler);
     signal(SIGTERM, exit_handler);
 }
+
+
+
+
+
+
 
 int main(int argc, char *argv[])
 {
@@ -749,11 +933,52 @@ int main(int argc, char *argv[])
     AVDictionary *opts = NULL;
     BMDPixelFormat pix = bmdFormat8BitYUV;
     HRESULT result;
-    pthread_t th;
+    pthread_t th, wsth;
 
     pthread_mutex_init(&sleepMutex, NULL);
     pthread_cond_init(&sleepCond, NULL);
     av_register_all();
+
+    std::regex r ("(\\d+)[:|\\/](\\d+)");
+    std::cmatch m;
+
+
+    int port = 9000;
+    //struct libwebsocket_context *context;
+    struct lws_context_creation_info context_info =
+    {
+        .port = port, .iface = NULL, .protocols = protocols, .extensions = NULL,
+        .ssl_cert_filepath = NULL, .ssl_private_key_filepath = NULL, .ssl_ca_filepath = NULL,
+        .gid = -1, .uid = -1, .options = 0, NULL, .ka_time = 0, .ka_probes = 0, .ka_interval = 0
+    };
+
+     // create libwebsocket context representing this server
+    context = libwebsocket_create_context(&context_info);
+
+    if (context == NULL) {
+        fprintf(stderr, "libwebsocket init failed\n");
+        return -1;
+    }
+
+        
+    printf("starting server...\n");
+
+    // infinite loop, to end this server send SIGTERM. (CTRL+C)
+    //while (1) {
+    //    libwebsocket_service(context, 50);
+//
+    //    printf("ping...\n");
+    //    libwebsocket_callback_on_writable_all_protocol(&protocols[1]);
+    //    
+    //    // libwebsocket_service will process all waiting events with their
+    //    // callback functions and then wait 50 ms.
+    //    // (this is a single threaded webserver and this will keep our server
+    //    // from generating load while there are not requests to process)
+    //}
+    //
+    //libwebsocket_context_destroy(context);
+    //printf("stopping server...\n");
+
 
     if (!deckLinkIterator) {
         fprintf(stderr,
@@ -762,7 +987,7 @@ int main(int argc, char *argv[])
     }
 
     // Parse command line options
-    while ((ch = getopt(argc, argv, "?hvc:s:f:a:m:n:p:M:F:C:A:V:o:w:S:d:")) != -1) {
+    while ((ch = getopt(argc, argv, "?hvc:s:f:a:m:n:p:M:F:C:A:V:o:w:S:d:r:")) != -1) {
         switch (ch) {
         case 'v':
             g_verbose = true;
@@ -871,6 +1096,19 @@ int main(int argc, char *argv[])
             break;
         case 'd':
             draw_bars = atoi(optarg);
+            break;
+        case 'r':
+           
+            if (regex_match (optarg, m, r )) {
+                dar.num = stoi(m[1]);
+                dar.den = stoi(m[2]);
+                fprintf(stderr, "Valid aspect ratio: %d:%d\n",
+                        dar.num, dar.den );
+
+            } else {
+                fprintf(stderr, "No valid aspect ratio: %s\n",
+                        optarg);
+            }
             break;
         case '?':
         case 'h':
@@ -1033,22 +1271,33 @@ int main(int argc, char *argv[])
         break;
     case bmdFormat10BitYUV:
         //fmt->video_codec = AV_CODEC_ID_V210;
-        fmt->video_codec = AV_CODEC_ID_FFV1;
+        fmt->video_codec = AV_CODEC_ID_PRORES;
         break;
     case bmdFormat10BitRGB:
         fmt->video_codec = AV_CODEC_ID_R210;
         break;
     }
 
-
+    //Context to decode v210 packet from decklink
     bmdCodec = avcodec_find_decoder(AV_CODEC_ID_V210);
     bmdCodecContext = avcodec_alloc_context3(bmdCodec);
     bmdCodecContext->width = displayMode->GetWidth();
     bmdCodecContext->height = displayMode->GetHeight();
     avcodec_open2(bmdCodecContext, bmdCodec, NULL);
 
-
-
+    //Context to encode mpeg frames to publish through websockets
+    wsCodec = avcodec_find_encoder(AV_CODEC_ID_MPEG1VIDEO);
+    wsCodecContext = avcodec_alloc_context3(wsCodec);
+    avcodec_get_context_defaults3(wsCodecContext, wsCodec);
+    wsCodecContext->pix_fmt = AV_PIX_FMT_YUV420P;
+    wsCodecContext->bits_per_raw_sample = 8;
+    wsCodecContext->gop_size = 0;
+    wsCodecContext->time_base.den = 25;
+    wsCodecContext->time_base.num = 1;
+    wsCodecContext->bit_rate = 64000;
+    wsCodecContext->width = displayMode->GetWidth();
+    wsCodecContext->height = displayMode->GetHeight();
+    avcodec_open2(wsCodecContext, wsCodec, NULL);
 
     fmt->audio_codec = (sample_fmt == AV_SAMPLE_FMT_S16 ? AV_CODEC_ID_PCM_S16LE : AV_CODEC_ID_PCM_S32LE);
 
@@ -1076,6 +1325,9 @@ int main(int argc, char *argv[])
     exitStatus = 0;
 
     if (pthread_create(&th, NULL, push_packet, oc))
+        goto bail;
+
+    if (pthread_create(&wsth, NULL, start_ws_server, NULL))
         goto bail;
 
     // Block main thread until signal occurs

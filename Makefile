@@ -28,15 +28,15 @@ prefix ?= /usr
 bindir ?= $(prefix)/bin
 
 CXX = g++
-SDK_PATH = /Users/picturae/Downloads/Blackmagic_DeckLink_SDK_10.5/Mac/include
+SDK_PATH = /Users/picturae/Downloads/Blackmagic_DeckLink_SDK_10.1.4/Mac/include
 
 SYS=$(shell uname)
 
-PKG_DEPS = libavcodec libavformat libswscale libavutil
+PKG_DEPS = libavcodec libavformat libswscale libavutil libwebsockets
 
 CXXFLAGS = $(ECXXFLAGS)
 LDFLAGS  = $(ELDFLAGS)
-
+#-I/usr/local/include/ -L/usr/local/lib/ -lwebsockets
 CXXFLAGS += `pkg-config --cflags $(PKG_DEPS)` -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS
 #CXXFLAGS += -I/Users/picturae/Downloads/ffmpeg -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS
 
